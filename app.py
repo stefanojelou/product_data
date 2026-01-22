@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import numpy as np
 
 # Page config
+# Updated: 2026-01-22 23:40
 st.set_page_config(
     page_title="Jelou Product Usage Analysis",
     page_icon="🧠",
