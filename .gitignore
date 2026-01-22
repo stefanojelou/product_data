@@ -10,15 +10,12 @@ ENV/
 .streamlit/
 static/
 
-# Data (Sensitive & Large files)
-data/
-*.csv
-*.xlsx
-*.json
-!data/excluded_companies.json # Keep the configuration if needed
-
 # IDEs
 .cursor/
 .vscode/
 .idea/
 
+# We are NOT ignoring data because the repo is private and small
+# data/
+# *.csv
+# *.xlsx
