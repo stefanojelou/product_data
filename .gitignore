@@ -16,6 +16,24 @@ static/
 .idea/
 
 # We are NOT ignoring data because the repo is private and small
-# data/
-# *.csv
-# *.xlsx
+# but we only include what's needed for the app
+data/*.csv
+data/*.xlsx
+data/*.json
+
+# Allow only necessary data files
+!data/signups.csv
+!data/subscriptions.csv
+!data/bots.csv
+!data/credit_wallet.csv
+!data/stripe_invoices.csv
+!data/wallet_transactions.csv
+!data/workflow_executions.csv
+!data/node_executions.csv
+!data/user_activity_logs.csv
+!data/user_sessions.csv
+!data/analysis_combined.csv
+!data/company_engagement.csv
+!data/template_usage_connect.csv
+!data/sessions_duration.csv
+!data/excluded_companies.json
