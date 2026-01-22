@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Streamlit
+.streamlit/
+static/
+
+# Data (Sensitive & Large files)
+data/
+*.csv
+*.xlsx
+*.json
+!data/excluded_companies.json # Keep the configuration if needed
+
+# IDEs
+.cursor/
+.vscode/
+.idea/
+
