@@ -255,6 +255,79 @@ def create_corrected_analysis(data):
                     print(f"[INFO] Filtered out {before_count - len(result)} test companies from analysis_combined.csv")
             except Exception as e:
                 print(f"[WARNING] Could not filter analysis data: {e}")
+
+        # Merge node type flags from nodes_used.csv if not already present
+        node_type_cols = [c for c in result.columns if c.startswith('node_type_')]
+        if len(node_type_cols) == 0:
+            nodes_path = Path("data/nodes_used.csv")
+            if nodes_path.exists():
+                try:
+                    nodes_df = pd.read_csv(nodes_path, on_bad_lines='skip')
+                    nodes_df['company_id'] = pd.to_numeric(nodes_df['company_id'], errors='coerce')
+                    nodes_df['nodeTypeId'] = pd.to_numeric(nodes_df['nodeTypeId'], errors='coerce')
+                    
+                    # Top 5 node types by total nodes_created
+                    node_type_totals = (
+                        nodes_df.groupby('nodeTypeId')['nodes_created']
+                        .sum()
+                        .sort_values(ascending=False)
+                    )
+                    top_5_types = node_type_totals.head(5).index.tolist()
+                    
+                    # Create flags per company
+                    nodes_df['node_type_group'] = np.where(
+                        nodes_df['nodeTypeId'].isin(top_5_types),
+                        nodes_df['nodeTypeId'],
+                        'other'
+                    )
+                    
+                    node_flags = (
+                        nodes_df.groupby(['company_id', 'node_type_group'])['nodes_created']
+                        .sum()
+                        .unstack(fill_value=0)
+                    )
+                    node_flags = (node_flags > 0).astype(int)
+                    
+                    # Rename columns with human-readable labels
+                    NODE_TYPE_ID_TO_NAME = {
+                        3: 'node_type_message',
+                        5: 'node_type_code',
+                        14: 'node_type_conditional',
+                        16: 'node_type_skill',
+                        18: 'node_type_memory',
+                    }
+                    def _node_type_flag_name(value):
+                        if value == 'other':
+                            return 'node_type_other'
+                        if isinstance(value, str):
+                            value = float(value)
+                        int_val = int(value)
+                        return NODE_TYPE_ID_TO_NAME.get(int_val, f"node_type_{int_val}")
+                    
+                    node_flags = node_flags.rename(columns=_node_type_flag_name).reset_index()
+                    
+                    # Merge into result
+                    result['company_id'] = pd.to_numeric(result['company_id'], errors='coerce')
+                    result = result.merge(node_flags, on='company_id', how='left')
+                    
+                    # Fill NaN with 0 for node type columns
+                    node_type_flag_cols = [c for c in node_flags.columns if c != 'company_id']
+                    for col in node_type_flag_cols:
+                        if col in result.columns:
+                            result[col] = result[col].fillna(0).astype(int)
+                    
+                    # Calculate total nodes created per company
+                    total_nodes = nodes_df.groupby('company_id')['nodes_created'].sum().reset_index()
+                    total_nodes.columns = ['company_id', 'total_nodes_created']
+                    result = result.merge(total_nodes, on='company_id', how='left')
+                    result['total_nodes_created'] = result['total_nodes_created'].fillna(0).astype(int)
+                    
+                    # Create 'created_node' flag (any node type)
+                    result['created_node'] = (result[node_type_flag_cols].sum(axis=1) > 0).astype(int)
+                    
+                    print(f"[INFO] Merged node type flags from nodes_used.csv: {node_type_flag_cols}")
+                except Exception as e:
+                    print(f"[WARNING] Could not merge node type flags: {e}")
         
         return result
     
@@ -317,8 +390,8 @@ def create_corrected_analysis(data):
         bot_companies = bots['company_id'].unique()
         signups['has_bot'] = signups['company_id'].isin(bot_companies)
         
-        # Production channel - the key metric!
-        prod_bots = bots[bots['in_production'] == 1]
+        # Live in Production - the key metric! (state = 1 AND in_production = 1)
+        prod_bots = bots[(bots['in_production'] == 1) & (bots['state'] == 1)]
         prod_companies = prod_bots['company_id'].unique()
         signups['has_prod_channel'] = signups['company_id'].isin(prod_companies)
         
@@ -1773,232 +1846,397 @@ def render_funnel(data, date_range, plan_filter="All Plans"):
             
             # --- Shared Funnel Metrics ---
             total = len(filtered)
-            has_bot = filtered['has_bot'].sum() if 'has_bot' in filtered.columns else 0
-            has_connect = filtered['has_connect'].sum() if 'has_connect' in filtered.columns else 0
-            has_template = filtered['has_template_usage'].sum() if 'has_template_usage' in filtered.columns else 0
-            connect_active = filtered['connect_active'].sum() if 'connect_active' in filtered.columns else 0
-            used_conv = filtered['used_conversations'].sum() if 'used_conversations' in filtered.columns else 0
-            exceeded = filtered['exceeded_free_tier'].sum() if 'exceeded_free_tier' in filtered.columns else 0
-            actually_paid = filtered['actually_paid'].sum() if 'actually_paid' in filtered.columns else 0
-            
-            # Get execution data by merging with engagement
-            executed_workflow = 0
-            tested_sandbox = 0
-            went_to_prod = 0
-            
-            if engagement is not None and len(engagement) > 0:
-                filtered_company_ids = set(filtered['company_id'].dropna().astype(int).unique())
-                eng_filtered = engagement[engagement['company_id'].isin(filtered_company_ids)]
-                
-                # Sets for overlap calculation
-                eng_company_ids = set(eng_filtered['company_id'].dropna().astype(int).unique())
-                connect_company_ids = set(filtered[filtered['has_connect'] == True]['company_id'].dropna().astype(int).unique()) if 'has_connect' in filtered.columns else set()
-                bot_ids = set(filtered[filtered['has_bot'] == True]['company_id'].dropna().astype(int).unique())
-                
-                # Mutually exclusive segments from Signup
-                overlap_count = len(eng_company_ids & connect_company_ids)
-                brain_only_engaged = len(eng_company_ids - connect_company_ids)
-                connect_only_engaged = len(connect_company_ids - eng_company_ids)
-                
-                # Signups who created a bot but never executed a workflow or started connect
-                idle_signups = len(bot_ids - eng_company_ids - connect_company_ids)
-                # Pure churn (no bot, no connect)
-                no_engagement = total - len(bot_ids | connect_company_ids)
-                
-                executed_workflow = len(eng_filtered)
-                tested_sandbox = len(eng_filtered[eng_filtered['sandbox_executions'] > 0]) if 'sandbox_executions' in eng_filtered.columns else 0
-                went_to_prod = len(eng_filtered[eng_filtered['prod_executions'] > 0]) if 'prod_executions' in eng_filtered.columns else 0
+            if total == 0:
+                st.warning("No data in the selected date range.")
             else:
-                overlap_count = brain_only_engaged = connect_only_engaged = 0
-                idle_signups = has_bot
-                no_engagement = total - has_bot
-                executed_workflow = tested_sandbox = went_to_prod = 0
-            
-            # Workflow sub-flows
-            exec_no_sandbox = executed_workflow - tested_sandbox
-            sandbox_no_prod = tested_sandbox - went_to_prod
-            
-            # Connect sub-flows
-            trial_no_template = has_connect - has_template
-            template_no_paid = has_template - connect_active
-            
-            # Build Sankey nodes and links
-            # Nodes: 
-            # 0: Signups
-            # 1: Ran Workflows
-            # 2: Started Connect Trial
-            # 3: Cross-Product Adoption
-            # 4: No further actions
-            # 5: Validated in Sandbox
-            # 6: Live in Production
-            # 7: Created Templates
-            # 8: Paid Connect Sub
-            # 9: Dropped Off
-            # 10: Used Conversations
-            
-            # Calculate final states (sink nodes) for correct percentages
-            # Everyone ends up in one of these 4 states:
-            val_no_actions = idle_signups  # Node 4
-            val_paid_connect = connect_active # Node 8
-            val_used_conv = used_conv # Node 10
-            val_dropped_off = total - val_no_actions - val_paid_connect - val_used_conv # Node 9
+                has_bot = filtered['has_bot'].sum() if 'has_bot' in filtered.columns else 0
+                has_connect = filtered['has_connect'].sum() if 'has_connect' in filtered.columns else 0
+                has_template = filtered['has_template_usage'].sum() if 'has_template_usage' in filtered.columns else 0
+                connect_active = filtered['connect_active'].sum() if 'connect_active' in filtered.columns else 0
 
-            labels = [
-                f"Signups (100%)",                                     # 0
-                f"Ran Workflows ({executed_workflow/total*100:.1f}%)",  # 1
-                f"Started Connect Trial ({has_connect/total*100:.1f}%)",# 2
-                f"Cross-Product Adoption ({overlap_count/total*100:.1f}%)", # 3
-                f"No further actions ({val_no_actions/total*100:.1f}%)",   # 4
-                f"Validated in Sandbox ({tested_sandbox/total*100:.1f}%)",# 5
-                f"Live in Production ({went_to_prod/total*100:.1f}%)",   # 6
-                f"Created Templates ({has_template/total*100:.1f}%)",   # 7
-                f"Paid Connect Sub ({val_paid_connect/total*100:.1f}%)",  # 8
-                f"Dropped Off ({val_dropped_off/total*100:.1f}%)",      # 9
-                f"Used Conversations ({val_used_conv/total*100:.1f}%)"  # 10
-            ]
-            
-            # Color scheme
-            node_colors = [
-                "#7C3AED", # Signups (Purple)
-                "#8B5CF6", # Ran Workflows (Violet)
-                "#F59E0B", # Connect Trial (Amber)
-                "#00D4AA", # Cross-Product (Teal)
-                "#6B7280", # No further actions (Gray)
-                "#A855F7", # Sandbox (Light Purple)
-                "#10B981", # Production (Green)
-                "#FBBF24", # Templates (Yellow)
-                "#00D4AA", # Paid (Teal)
-                "#EF4444", # Dropped Off (Red)
-                "#00D4AA"  # Used Conv (Teal)
-            ]
-            
-            links_source = []
-            links_target = []
-            links_value = []
-            links_color = []
-            
-            # Split Signups into mutually exclusive groups
-            if brain_only_engaged > 0:
-                links_source.append(0); links_target.append(1); links_value.append(brain_only_engaged); links_color.append("rgba(139, 92, 246, 0.4)")
-            if connect_only_engaged > 0:
-                links_source.append(0); links_target.append(2); links_value.append(connect_only_engaged); links_color.append("rgba(245, 158, 11, 0.4)")
-            if overlap_count > 0:
-                links_source.append(0); links_target.append(3); links_value.append(overlap_count); links_color.append("rgba(0, 212, 170, 0.6)")
-            if idle_signups > 0:
-                links_source.append(0); links_target.append(4); links_value.append(idle_signups); links_color.append("rgba(107, 114, 128, 0.3)")
-            if no_engagement > 0:
-                links_source.append(0); links_target.append(9); links_value.append(no_engagement); links_color.append("rgba(239, 68, 68, 0.2)")
+                # ============================================================
+                # COLUMN 2: Created Node vs Did Not Create Node
+                # ============================================================
+                node_type_cols = [col for col in filtered.columns if col.startswith('node_type_')]
+                node_type_other_col = 'node_type_other' if 'node_type_other' in node_type_cols else None
+                node_type_base_cols_orig = [col for col in node_type_cols if col != 'node_type_other']
+                node_type_order = []
+                node_type_counts = pd.Series(dtype=int)
+                node_type_group = pd.Series(index=filtered.index, dtype=object)
+                created_node_flag = pd.Series(False, index=filtered.index)
 
-            # Brain Path
-            if brain_only_engaged > 0:
-                brain_to_sandbox = int(brain_only_engaged * (tested_sandbox / executed_workflow)) if executed_workflow > 0 else 0
-                if brain_to_sandbox > 0:
-                    links_source.append(1); links_target.append(5); links_value.append(brain_to_sandbox); links_color.append("rgba(168, 85, 247, 0.4)")
-                if brain_only_engaged - brain_to_sandbox > 0:
-                    links_source.append(1); links_target.append(9); links_value.append(brain_only_engaged - brain_to_sandbox); links_color.append("rgba(239, 68, 68, 0.3)")
+                if len(node_type_cols) > 0:
+                    node_type_base_cols = (
+                        filtered[node_type_base_cols_orig].fillna(0).sum()
+                        .sort_values(ascending=False)
+                        .head(5)
+                        .index.tolist()
+                    )
+                    node_type_order = node_type_base_cols + ([node_type_other_col] if node_type_other_col else [])
 
-            if overlap_count > 0:
-                links_source.append(3); links_target.append(5); links_value.append(overlap_count/2); links_color.append("rgba(0, 212, 170, 0.4)")
-                links_source.append(3); links_target.append(7); links_value.append(overlap_count/2); links_color.append("rgba(0, 212, 170, 0.4)")
+                    node_type_matrix = filtered[node_type_order].fillna(0).astype(int)
+                    created_node_flag = node_type_matrix.sum(axis=1) > 0
 
-            # Sandbox -> Production
-            if tested_sandbox > 0:
-                prod_val = went_to_prod
-                if prod_val > 0:
-                    links_source.append(5); links_target.append(6); links_value.append(prod_val); links_color.append("rgba(16, 185, 129, 0.5)")
-                if tested_sandbox - prod_val > 0:
-                    links_source.append(5); links_target.append(9); links_value.append(max(0, tested_sandbox - prod_val)); links_color.append("rgba(239, 68, 68, 0.3)")
+                    # Exclusive assignment: first matching flag (ordered by popularity)
+                    idx_arr = node_type_matrix.to_numpy().argmax(axis=1)
+                    node_type_group = pd.Series(
+                        np.where(created_node_flag, np.array(node_type_order)[idx_arr], None),
+                        index=filtered.index
+                    )
+                    node_type_counts = node_type_group.value_counts()
 
-            # Production -> Used Conversations
-            if went_to_prod > 0:
-                if used_conv > 0:
-                    links_source.append(6); links_target.append(10); links_value.append(used_conv); links_color.append("rgba(0, 212, 170, 0.5)")
-                if went_to_prod - used_conv > 0:
-                    links_source.append(6); links_target.append(9); links_value.append(max(0, went_to_prod - used_conv)); links_color.append("rgba(239, 68, 68, 0.3)")
+                # Fallback if no node_type flags but total_nodes_created exists
+                if created_node_flag.sum() == 0 and 'total_nodes_created' in filtered.columns:
+                    created_node_flag = filtered['total_nodes_created'].fillna(0) > 0
 
-            # Used Conv -> Drop (since none convert yet in this cohort)
-            if used_conv > 0:
-                links_source.append(10); links_target.append(9); links_value.append(used_conv); links_color.append("rgba(239, 68, 68, 0.3)")
+                created_node_count = int(created_node_flag.sum())
+                did_not_create_node_count = total - created_node_count
 
-            # Connect Path
-            if connect_only_engaged > 0:
-                connect_to_tpl = int(connect_only_engaged * (has_template / has_connect)) if has_connect > 0 else 0
-                if connect_to_tpl > 0:
-                    links_source.append(2); links_target.append(7); links_value.append(connect_to_tpl); links_color.append("rgba(251, 191, 36, 0.4)")
-                if connect_only_engaged - connect_to_tpl > 0:
-                    links_source.append(2); links_target.append(9); links_value.append(connect_only_engaged - connect_to_tpl); links_color.append("rgba(239, 68, 68, 0.3)")
+                # Add created_node_flag to filtered for downstream calculations
+                filtered = filtered.copy()
+                filtered['_created_node'] = created_node_flag
+                filtered['_node_type_group'] = node_type_group
 
-            # Template -> Paid
-            if has_template > 0:
-                paid_val = connect_active
-                if paid_val > 0:
-                    links_source.append(7); links_target.append(8); links_value.append(paid_val); links_color.append("rgba(0, 212, 170, 0.5)")
-                if has_template - paid_val > 0:
-                    links_source.append(7); links_target.append(9); links_value.append(max(0, has_template - paid_val)); links_color.append("rgba(239, 68, 68, 0.3)")
+                # ============================================================
+                # COLUMN 4: Engagement metrics (Ran Workflows, Connect Trial, Cross-Product)
+                # ============================================================
+                engagement = data.get('company_engagement')
+                executed_workflow = 0
+                tested_sandbox = 0
+                went_to_prod = 0
+                eng_company_ids = set()
+                connect_company_ids = set()
 
-            fig = go.Figure(go.Sankey(
-                node=dict(
-                    pad=20,
-                    thickness=25,
-                    line=dict(color="black", width=0.5),
-                    label=labels,
-                    color=node_colors,
-                    customdata=labels,
-                    hovertemplate="%{label}: %{value} companies<extra></extra>"
-                ),
-                link=dict(
-                    source=links_source,
-                    target=links_target,
-                    value=links_value,
-                    color=links_color
+                if engagement is not None and len(engagement) > 0:
+                    filtered_company_ids = set(filtered['company_id'].dropna().astype(int).unique())
+                    eng_filtered = engagement[engagement['company_id'].isin(filtered_company_ids)]
+                    eng_company_ids = set(eng_filtered['company_id'].dropna().astype(int).unique())
+                    executed_workflow = len(eng_company_ids)
+                    tested_sandbox = len(eng_filtered[eng_filtered['sandbox_executions'] > 0]) if 'sandbox_executions' in eng_filtered.columns else 0
+                    went_to_prod = len(eng_filtered[eng_filtered['prod_executions'] > 0]) if 'prod_executions' in eng_filtered.columns else 0
+
+                if 'has_connect' in filtered.columns:
+                    connect_company_ids = set(filtered[filtered['has_connect'] == True]['company_id'].dropna().astype(int).unique())
+
+                # Cross-product = ran workflow AND started connect
+                cross_product_ids = eng_company_ids & connect_company_ids
+                cross_product_count = len(cross_product_ids)
+
+                # Ran workflows only (not connect)
+                ran_workflows_only_ids = eng_company_ids - connect_company_ids
+                ran_workflows_count = len(ran_workflows_only_ids)
+
+                # Connect trial only (not ran workflow)
+                connect_trial_only_ids = connect_company_ids - eng_company_ids
+                connect_trial_count = len(connect_trial_only_ids)
+
+                # ============================================================
+                # Per-company flags for flow calculation
+                # ============================================================
+                filtered['_ran_workflow'] = filtered['company_id'].isin(eng_company_ids)
+                filtered['_connect_trial'] = filtered['company_id'].isin(connect_company_ids)
+                filtered['_cross_product'] = filtered['company_id'].isin(cross_product_ids)
+                filtered['_ran_workflow_only'] = filtered['company_id'].isin(ran_workflows_only_ids)
+                filtered['_connect_trial_only'] = filtered['company_id'].isin(connect_trial_only_ids)
+
+                # Column 4 engagement (any of the 3)
+                filtered['_col4_engaged'] = filtered['_ran_workflow'] | filtered['_connect_trial']
+
+                # ============================================================
+                # COLUMN 5 & 6: Final outcomes
+                # ============================================================
+                # Sandbox/Production from engagement data
+                sandbox_ids = set()
+                prod_ids = set()
+                if engagement is not None and len(engagement) > 0:
+                    filtered_company_ids = set(filtered['company_id'].dropna().astype(int).unique())
+                    eng_filtered = engagement[engagement['company_id'].isin(filtered_company_ids)]
+                    if 'sandbox_executions' in eng_filtered.columns:
+                        sandbox_ids = set(eng_filtered[eng_filtered['sandbox_executions'] > 0]['company_id'].unique())
+                    if 'prod_executions' in eng_filtered.columns:
+                        prod_ids = set(eng_filtered[eng_filtered['prod_executions'] > 0]['company_id'].unique())
+
+                filtered['_sandbox'] = filtered['company_id'].isin(sandbox_ids)
+                filtered['_production'] = filtered['company_id'].isin(prod_ids)
+                filtered['_templates'] = filtered['has_template_usage'] == True if 'has_template_usage' in filtered.columns else False
+                filtered['_paid_connect'] = filtered['connect_active'] == True if 'connect_active' in filtered.columns else False
+
+                # ============================================================
+                # Calculate flow values for each path
+                # ============================================================
+                # Node type -> Col4 flows
+                node_type_to_col4 = {}
+                for col in node_type_order:
+                    mask = filtered['_node_type_group'] == col
+                    sub = filtered[mask]
+                    to_ran = int((sub['_ran_workflow_only']).sum())
+                    to_connect = int((sub['_connect_trial_only']).sum())
+                    to_cross = int((sub['_cross_product']).sum())
+                    to_dropped = int((~sub['_col4_engaged']).sum())
+                    node_type_to_col4[col] = {'ran': to_ran, 'connect': to_connect, 'cross': to_cross, 'dropped': to_dropped}
+
+                # Did Not Create -> Col4/NoFurtherActions
+                no_node_mask = ~filtered['_created_node']
+                no_node = filtered[no_node_mask]
+                no_node_to_ran = int((no_node['_ran_workflow_only']).sum())
+                no_node_to_connect = int((no_node['_connect_trial_only']).sum())
+                no_node_to_cross = int((no_node['_cross_product']).sum())
+                no_node_no_action = int((~no_node['_col4_engaged']).sum())
+
+                # Col4 -> Col5
+                # Ran Workflows -> Sandbox or Dropped
+                ran_mask = filtered['_ran_workflow_only']
+                ran_to_sandbox = int((filtered[ran_mask]['_sandbox']).sum())
+                ran_to_dropped = int(ran_mask.sum()) - ran_to_sandbox
+
+                # Connect Trial -> Templates or Dropped
+                connect_mask = filtered['_connect_trial_only']
+                connect_to_templates = int((filtered[connect_mask]['_templates']).sum())
+                connect_to_dropped = int(connect_mask.sum()) - connect_to_templates
+
+                # Cross Product -> split to Sandbox and Templates
+                cross_mask = filtered['_cross_product']
+                cross_to_sandbox = int((filtered[cross_mask]['_sandbox']).sum())
+                cross_to_templates = int((filtered[cross_mask]['_templates']).sum())
+                cross_to_dropped = int(cross_mask.sum()) - cross_to_sandbox - cross_to_templates
+                if cross_to_dropped < 0:
+                    cross_to_dropped = 0
+
+                # Col5 -> Col6
+                # Sandbox -> Production or Dropped
+                sandbox_mask = filtered['_sandbox']
+                sandbox_to_prod = int((filtered[sandbox_mask]['_production']).sum())
+                sandbox_to_dropped = int(sandbox_mask.sum()) - sandbox_to_prod
+
+                # Templates -> Paid Connect or Dropped
+                templates_mask = filtered['_templates']
+                templates_to_paid = int((filtered[templates_mask]['_paid_connect']).sum())
+                templates_to_dropped = int(templates_mask.sum()) - templates_to_paid
+
+                # Final column 6 totals
+                final_production = int(filtered['_production'].sum())
+                final_paid = int(filtered['_paid_connect'].sum())
+                final_no_further = no_node_no_action
+                final_dropped = total - final_production - final_paid - final_no_further
+
+                # ============================================================
+                # BUILD SANKEY NODES
+                # Column 1: Signups (idx 0)
+                # Column 2: Created Node (idx 1), Did Not Create Node (idx 2)
+                # Column 3: Node Types (idx 3-8, dynamic based on node_type_order)
+                # Column 4: Ran Workflows (idx 9), Connect Trial (idx 10), Cross-Product (idx 11)
+                # Column 5: Validated in Sandbox (idx 12), Created Templates (idx 13)
+                # Column 6: Live in Production (idx 14), Paid Connect (idx 15), Dropped Off (idx 16), No Further Actions (idx 17)
+                # ============================================================
+                pct = lambda v: f"{v/total*100:.1f}%" if total > 0 else "0%"
+
+                labels = [
+                    f"Signups (100%)",                                      # 0
+                    f"Created Node ({pct(created_node_count)})",            # 1
+                    f"Did Not Create Node ({pct(did_not_create_node_count)})",  # 2
+                ]
+
+                # Column 3: Node types (indices 3 to 3+len(node_type_order)-1)
+                # Human-readable node type labels
+                NODE_TYPE_DISPLAY_NAMES = {
+                    'node_type_message': 'Message',
+                    'node_type_code': 'Code',
+                    'node_type_conditional': 'Conditional',
+                    'node_type_skill': 'Skill',
+                    'node_type_memory': 'Memory',
+                    'node_type_other': 'Other',
+                    # Fallback for numeric IDs (backward compatibility)
+                    'node_type_3': 'Message',
+                    'node_type_5': 'Code',
+                    'node_type_14': 'Conditional',
+                    'node_type_16': 'Skill',
+                    'node_type_18': 'Memory',
+                }
+                node_type_start_idx = len(labels)
+                node_type_indices = {}
+                for col in node_type_order:
+                    count = int(node_type_counts.get(col, 0))
+                    label_name = NODE_TYPE_DISPLAY_NAMES.get(col, col.replace('node_type_', 'Type '))
+                    labels.append(f"{label_name} ({pct(count)})")
+                    node_type_indices[col] = len(labels) - 1
+
+                # Column 4
+                idx_ran_workflows = len(labels)
+                labels.append(f"Ran Workflows ({pct(ran_workflows_count + cross_product_count)})")
+                idx_connect_trial = len(labels)
+                labels.append(f"Started Connect Trial ({pct(connect_trial_count + cross_product_count)})")
+                idx_cross_product = len(labels)
+                labels.append(f"Cross-Product ({pct(cross_product_count)})")
+
+                # Column 5
+                idx_sandbox = len(labels)
+                labels.append(f"Validated in Sandbox ({pct(int(filtered['_sandbox'].sum()))})")
+                idx_templates = len(labels)
+                labels.append(f"Created Templates ({pct(int(filtered['_templates'].sum()))})")
+
+                # Column 6 (Final - sums to 100%)
+                idx_production = len(labels)
+                labels.append(f"Live in Production ({pct(final_production)})")
+                idx_paid = len(labels)
+                labels.append(f"Paid Connect ({pct(final_paid)})")
+                idx_dropped = len(labels)
+                labels.append(f"Dropped Off ({pct(final_dropped)})")
+                idx_no_further = len(labels)
+                labels.append(f"No Further Actions ({pct(final_no_further)})")
+
+                # ============================================================
+                # NODE COLORS
+                # ============================================================
+                node_colors = [
+                    "#7C3AED",  # 0 Signups (Purple)
+                    "#38BDF8",  # 1 Created Node (Light Blue)
+                    "#94A3B8",  # 2 Did Not Create Node (Gray)
+                ]
+                # Node types
+                for col in node_type_order:
+                    if col == 'node_type_other':
+                        node_colors.append("#64748B")  # Other (Slate)
+                    else:
+                        node_colors.append("#60A5FA")  # Node Type (Blue)
+                # Column 4
+                node_colors.append("#8B5CF6")  # Ran Workflows (Violet)
+                node_colors.append("#F59E0B")  # Connect Trial (Amber)
+                node_colors.append("#00D4AA")  # Cross-Product (Teal)
+                # Column 5
+                node_colors.append("#A855F7")  # Sandbox (Light Purple)
+                node_colors.append("#FBBF24")  # Templates (Yellow)
+                # Column 6
+                node_colors.append("#10B981")  # Production (Green)
+                node_colors.append("#00D4AA")  # Paid (Teal)
+                node_colors.append("#EF4444")  # Dropped Off (Red)
+                node_colors.append("#6B7280")  # No Further Actions (Gray)
+
+                # ============================================================
+                # BUILD SANKEY LINKS
+                # ============================================================
+                links_source = []
+                links_target = []
+                links_value = []
+                links_color = []
+
+                def add_link(src, tgt, val, color):
+                    if val > 0:
+                        links_source.append(src)
+                        links_target.append(tgt)
+                        links_value.append(val)
+                        links_color.append(color)
+
+                # Column 1 -> Column 2: Signups -> Created Node / Did Not Create Node
+                add_link(0, 1, created_node_count, "rgba(56, 189, 248, 0.5)")
+                add_link(0, 2, did_not_create_node_count, "rgba(148, 163, 184, 0.4)")
+
+                # Column 2 -> Column 3: Created Node -> Node Types
+                for col in node_type_order:
+                    count = int(node_type_counts.get(col, 0))
+                    add_link(1, node_type_indices[col], count, "rgba(96, 165, 250, 0.5)")
+
+                # Column 3 -> Column 4/6: Node Types -> Ran Workflows / Connect Trial / Cross-Product / Dropped
+                for col in node_type_order:
+                    flows = node_type_to_col4.get(col, {})
+                    src_idx = node_type_indices[col]
+                    add_link(src_idx, idx_ran_workflows, flows.get('ran', 0), "rgba(139, 92, 246, 0.4)")
+                    add_link(src_idx, idx_connect_trial, flows.get('connect', 0), "rgba(245, 158, 11, 0.4)")
+                    add_link(src_idx, idx_cross_product, flows.get('cross', 0), "rgba(0, 212, 170, 0.4)")
+                    add_link(src_idx, idx_dropped, flows.get('dropped', 0), "rgba(239, 68, 68, 0.3)")
+
+                # Column 2 -> Column 4/6: Did Not Create Node -> Ran Workflows / Connect Trial / Cross-Product / No Further Actions
+                add_link(2, idx_ran_workflows, no_node_to_ran, "rgba(139, 92, 246, 0.4)")
+                add_link(2, idx_connect_trial, no_node_to_connect, "rgba(245, 158, 11, 0.4)")
+                add_link(2, idx_cross_product, no_node_to_cross, "rgba(0, 212, 170, 0.4)")
+                add_link(2, idx_no_further, no_node_no_action, "rgba(107, 114, 128, 0.4)")
+
+                # Column 4 -> Column 5/6: Ran Workflows -> Sandbox / Dropped
+                add_link(idx_ran_workflows, idx_sandbox, ran_to_sandbox, "rgba(168, 85, 247, 0.5)")
+                add_link(idx_ran_workflows, idx_dropped, ran_to_dropped, "rgba(239, 68, 68, 0.3)")
+
+                # Column 4 -> Column 5/6: Connect Trial -> Templates / Dropped
+                add_link(idx_connect_trial, idx_templates, connect_to_templates, "rgba(251, 191, 36, 0.5)")
+                add_link(idx_connect_trial, idx_dropped, connect_to_dropped, "rgba(239, 68, 68, 0.3)")
+
+                # Column 4 -> Column 5/6: Cross-Product -> Sandbox / Templates / Dropped
+                add_link(idx_cross_product, idx_sandbox, cross_to_sandbox, "rgba(0, 212, 170, 0.4)")
+                add_link(idx_cross_product, idx_templates, cross_to_templates, "rgba(0, 212, 170, 0.4)")
+                add_link(idx_cross_product, idx_dropped, cross_to_dropped, "rgba(239, 68, 68, 0.3)")
+
+                # Column 5 -> Column 6: Sandbox -> Production / Dropped
+                add_link(idx_sandbox, idx_production, sandbox_to_prod, "rgba(16, 185, 129, 0.5)")
+                add_link(idx_sandbox, idx_dropped, sandbox_to_dropped, "rgba(239, 68, 68, 0.3)")
+
+                # Column 5 -> Column 6: Templates -> Paid Connect / Dropped
+                add_link(idx_templates, idx_paid, templates_to_paid, "rgba(0, 212, 170, 0.5)")
+                add_link(idx_templates, idx_dropped, templates_to_dropped, "rgba(239, 68, 68, 0.3)")
+
+                # ============================================================
+                # CREATE SANKEY FIGURE
+                # ============================================================
+                fig = go.Figure(go.Sankey(
+                    node=dict(
+                        pad=20,
+                        thickness=25,
+                        line=dict(color="black", width=0.5),
+                        label=labels,
+                        color=node_colors,
+                        customdata=labels,
+                        hovertemplate="%{label}: %{value} companies<extra></extra>"
+                    ),
+                    link=dict(
+                        source=links_source,
+                        target=links_target,
+                        value=links_value,
+                        color=links_color
+                    )
+                ))
+
+                fig.update_layout(
+                    title="User Journey: From Signup to Conversion",
+                    template="plotly_dark",
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    font=dict(family="Space Grotesk", size=13),
+                    height=700
                 )
-            ))
-            
-            fig.update_layout(
-                title="Visualizing the Leak: From Signup to Production",
-                template="plotly_dark",
-                paper_bgcolor='rgba(0,0,0,0)',
-                font=dict(family="Space Grotesk", size=13),
-                height=650
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Narrative Summary
-            st.markdown("### 📖 The Story of the Data")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(f"""
-                **1. The Workflow Gap**
-                - Out of **{total}** signups, only **{executed_workflow}** ({executed_workflow/total*100:.1f}%) actually ran a workflow.
-                - La gran mayoría (**{val_no_actions/total*100:.1f}%**) se registra pero no realiza ninguna acción manual adicional.
-                
-                **2. Multi-Product Behavior**
-                - Existe un traslape de **{overlap_count}** empresas usando Brain y Connect.
-                - Actualmente, los usuarios de **Connect** son los únicos que están convirtiendo a pago en este periodo.
-                """)
-            with col2:
-                st.markdown(f"""
-                **3. Production Friction**
-                - La mayor pérdida de usuarios ocurre entre **Sandbox → Production**.
-                - Conectar un número real de WhatsApp es la barrera técnica más grande.
-                
-                **4. Connect Conversion**
-                - Crear plantillas es el indicador más fuerte de que un usuario de Connect llegará a pagar.
-                """)
-            
-            with st.expander("🔍 Glosario de Variables"):
-                st.markdown("""
-                | Variable | Definición Técnica | Origen de Datos |
-                | :--- | :--- | :--- |
-                | **Signups** | Cuentas creadas en el periodo seleccionado. | `chatbot.companies` |
-                | **No further actions** | Usuarios con bot auto-creado que nunca abrieron el builder ni iniciaron Connect. | `chatbot.bots` + exclusion logic |
-                | **Ran Workflows** | Usuarios que ejecutaron al menos un nodo en el constructor de flujos. | MongoDB `workflow_executions` |
-                | **Validated in Sandbox** | Ejecuciones realizadas en modo depuración (`isDebug=true`). | MongoDB `workflow_executions` |
-                | **Live in Production** | Ejecuciones con tráfico real o modo producción (`isDebug=false`). | MongoDB `workflow_executions` |
-                | **Created Templates** | Usuarios que crearon al menos una plantilla de mensaje en Connect. | `template_logs` |
-                | **Paid Connect Sub** | Usuarios con suscripción a Connect en estado 'ACTIVE'. | `billing.subscriptions` |
-                | **Used Conversations** | Consumo de créditos/conversaciones reales en producción. | `billing.credit_wallet` |
-                """)
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Narrative Summary
+                st.markdown("### 📖 The Story of the Data")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"""
+                    **1. Node Creation**
+                    - Out of **{total}** signups, **{created_node_count}** ({pct(created_node_count)}) created at least one node.
+                    - **{did_not_create_node_count}** ({pct(did_not_create_node_count)}) did not create any nodes.
+
+                    **2. Engagement Funnel**
+                    - **{ran_workflows_count + cross_product_count}** ran workflows, **{connect_trial_count + cross_product_count}** started Connect trial.
+                    - Cross-product adoption: **{cross_product_count}** ({pct(cross_product_count)}) use both Brain and Connect.
+                    """)
+                with col2:
+                    st.markdown(f"""
+                    **3. Final Outcomes (Column 6 = 100%)**
+                    - Live in Production: **{final_production}** ({pct(final_production)})
+                    - Paid Connect: **{final_paid}** ({pct(final_paid)})
+                    - Dropped Off: **{final_dropped}** ({pct(final_dropped)})
+                    - No Further Actions: **{final_no_further}** ({pct(final_no_further)})
+                    """)
+
+                with st.expander("🔍 Glosario de Variables"):
+                    st.markdown("""
+                    | Variable | Definición Técnica | Origen de Datos |
+                    | :--- | :--- | :--- |
+                    | **Signups** | Cuentas creadas en el periodo seleccionado. | `chatbot.companies` |
+                    | **Created Node** | Usuarios que crearon al menos un nodo en el builder. | `node_type_*` flags |
+                    | **Did Not Create Node** | Usuarios que no crearon ningún nodo. | Inverse of Created Node |
+                    | **Ran Workflows** | Usuarios que ejecutaron al menos un workflow. | MongoDB `workflow_executions` |
+                    | **Validated in Sandbox** | Ejecuciones en modo depuración (`isDebug=true`). | MongoDB `workflow_executions` |
+                    | **Live in Production** | Bot activo con canal de producción conectado (`state=1 AND in_production=1`). | `chatbot.bots` |
+                    | **Created Templates** | Usuarios que crearon plantillas en Connect. | `template_logs` |
+                    | **Paid Connect** | Suscripción Connect en estado 'ACTIVE'. | `billing.subscriptions` |
+                    | **No Further Actions** | Usuarios que no crearon nodos ni hicieron engagement. | Exclusion logic |
+                    """)
         else:
             st.error("No data available")
     
@@ -2006,8 +2244,33 @@ def render_funnel(data, date_range, plan_filter="All Plans"):
         st.markdown("### 🧠 Brain Studio Funnel")
         st.caption("Free tier + usage-based billing (pay per conversation after free limit)")
         
+        # Recalculate metrics for this tab
+        analysis = get_analysis_df(data)
+        engagement = data.get('company_engagement')
+        
         if analysis is not None:
-            # Metrics are already defined above in the shared block
+            mask = (analysis['created_at'] >= pd.Timestamp(date_range[0])) & \
+                   (analysis['created_at'] <= pd.Timestamp(date_range[1]))
+            filtered = analysis[mask].copy()
+            if plan_filter != "All Plans" and 'plan' in filtered.columns:
+                filtered = filtered[filtered['plan'] == plan_filter]
+            
+            total = len(filtered)
+            has_bot = filtered['has_bot'].sum() if 'has_bot' in filtered.columns else 0
+            used_conv = filtered['used_conversations'].sum() if 'used_conversations' in filtered.columns else 0
+            exceeded = filtered['exceeded_free_tier'].sum() if 'exceeded_free_tier' in filtered.columns else 0
+            actually_paid = filtered['actually_paid'].sum() if 'actually_paid' in filtered.columns else 0
+            
+            # Get execution data from engagement
+            executed_workflow = 0
+            tested_sandbox = 0
+            went_to_prod = 0
+            if engagement is not None and len(engagement) > 0:
+                filtered_company_ids = set(filtered['company_id'].dropna().astype(int).unique())
+                eng_filtered = engagement[engagement['company_id'].isin(filtered_company_ids)]
+                executed_workflow = len(eng_filtered)
+                tested_sandbox = len(eng_filtered[eng_filtered['sandbox_executions'] > 0]) if 'sandbox_executions' in eng_filtered.columns else 0
+                went_to_prod = len(eng_filtered[eng_filtered['prod_executions'] > 0]) if 'prod_executions' in eng_filtered.columns else 0
             
             # Brain Studio funnel with execution steps
             brain_funnel = pd.DataFrame({

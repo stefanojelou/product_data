@@ -51,12 +51,12 @@ User Executes Workflow ← MAJOR DROP-OFF (only 11% reach this!)
    ├─────────────────────────────┐
    │                             │
    ▼                             ▼
-Sandbox Testing (29)        Production Execution (21)
-   │  └── isDebug=true          │  └── isDebug=false
+Sandbox Testing (29)        Live in Production (63)
+   │  └── isDebug=true          │  └── bots: state=1 AND in_production=1
    │                             │
    │                             ▼
-   │                        WhatsApp Channel (?)
-   │                             │  └── channel="WHATSAPP"
+   │                        WhatsApp Channel Connected
+   │                             │  └── Bot has production channel
    │                             │
    └──────────────┬──────────────┘
                   │
@@ -81,7 +81,7 @@ Sandbox Testing (29)        Production Execution (21)
 | Created Bot | 338 | 100% | chatbot.bots (auto-created) |
 | Executed Workflow | 36 | 11% | MongoDB workflow_executions |
 | Tested Sandbox | 29 | 9% | workflow_executions (sandbox_executions > 0) |
-| Went to Production | 21 | 6% | workflow_executions (prod_executions > 0) |
+| Live in Production | 63 | ~15% | chatbot.bots (state=1 AND in_production=1) |
 
 **Key Insight:** 89% of users never execute a single workflow!
 
@@ -130,8 +130,8 @@ The Streamlit dashboard now includes a **Sankey diagram** that visualizes:
     ┌───────────────┴───────────────┐                     │
     │                               │                     │
     ▼                               ▼                     ▼
-Created Bot ─────────────────► Executed ──► Sandbox ──► Production
-(338)        No Execution      (36)         (29)        (21)
+Created Bot ─────────────────► Executed ──► Sandbox ──► Live in Production
+(338)        No Execution      (36)         (29)        (63)
              (302 = 89%!)
     │
     │
@@ -154,7 +154,7 @@ The Sankey diagram reveals whether users who execute workflows are the same ones
 | Table | Key Fields | Purpose |
 |-------|------------|---------|
 | `companies` | id, plan, createdAt, inProduction | Signups |
-| `bots` | companyId, inProduction, type, createdAt | Bot/Channel tracking |
+| `bots` | companyId, state, inProduction, type, createdAt | Bot/Channel tracking. **Live in Production** = `state=1 AND inProduction=1` |
 
 ### MySQL - billing database:
 | Table | Key Fields | Purpose |
@@ -185,7 +185,7 @@ The Sankey diagram reveals whether users who execute workflows are the same ones
 | 2. Created Bot | Has at least 1 bot | `chatbot.bots` (auto-created) |
 | 3. Executed Workflow | Ran workflow in builder | MongoDB `workflow_executions` |
 | 4. Tested Sandbox | `isDebug=true` execution | `workflow_executions` sandbox_executions > 0 |
-| 5. Went to Production | `isDebug=false` execution | `workflow_executions` prod_executions > 0 |
+| 5. Live in Production | Bot active with production channel (`state=1 AND in_production=1`) | `chatbot.bots` |
 | 6. Used Conversations | Had real chats | `credit_wallet.total_used > 0` |
 | 7. Exceeded Free Tier | Billable usage | `total_used > free_conversations` |
 | 8. Actually Paid | Payment received | `stripe_invoices.amount_paid > 0` |
